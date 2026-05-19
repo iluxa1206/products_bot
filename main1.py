@@ -3,23 +3,28 @@ import logging
 import os
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters.command import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, ReplyKeyboardRemove
 
 # --- Конфигурация ---
 BOT_TOKEN = "6668788537:AAFmwHuuJkn9g_DUQeIZ-dXZYN-hfkPL_IQ"
-PDF_FOLDER_PATH = 'product_files/'
+PDF_FOLDER_PATH = Path('product_files/')
 DB_NAME = 'db.db'
 
-# Настройка логирования в консоль
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -45,45 +50,71 @@ class RequestPhoneNumber(StatesGroup):
 # --- Работа с базой данных ---
 
 def init_db():
-    """Создает необходимые таблицы при запуске [cite: 37, 38]"""
-    conn = sqlite3.connect(DB_NAME)
-    # Основная таблица пользователей (уже есть в вашем файле) [cite: 38]
-    conn.execute('''CREATE TABLE IF NOT EXISTS users
-                    (user_name TEXT PRIMARY KEY, is_admin INTEGER)''')
-    # Таблица логов скачивания
-    conn.execute('''CREATE TABLE IF NOT EXISTS download_logs
-                    (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     user_name TEXT,
-                     file_name TEXT,
-                     timestamp DATETIME)''')
-    conn.commit()
-    conn.close()
+    """Создает необходимые таблицы при запуске"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute('''CREATE TABLE IF NOT EXISTS users
+                        (user_name TEXT PRIMARY KEY, is_admin INTEGER)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS download_logs
+                        (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         user_name TEXT,
+                         file_name TEXT,
+                         timestamp DATETIME)''')
+        conn.commit()
+        logger.info("База данных инициализирована")
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка инициализации БД: {e}")
+    finally:
+        conn.close()
 
 def is_admin(user_id_or_name):
-    if not user_id_or_name: return False
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT is_admin FROM users WHERE user_name = ?", (str(user_id_or_name).replace("@", ""),))
-    result = cursor.fetchone()
-    conn.close()
-    return result and result[0] == 1
+    if not user_id_or_name: 
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_admin FROM users WHERE user_name = ?", (str(user_id_or_name).replace("@", ""),))
+        result = cursor.fetchone()
+        return result and result[0] == 1
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка проверки админа: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 def is_registered(user_id_or_name):
-    if not user_id_or_name: return False
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_name FROM users WHERE user_name = ?", (str(user_id_or_name).replace("@", ""),))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
+    if not user_id_or_name: 
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_name FROM users WHERE user_name = ?", (str(user_id_or_name).replace("@", ""),))
+        result = cursor.fetchone()
+        return result is not None
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка проверки регистрации: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 def log_event(user_name, file_name):
     """Записывает действие в базу логов"""
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("INSERT INTO download_logs (user_name, file_name, timestamp) VALUES (?, ?, ?)",
-                 (user_name, file_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-    conn.close()
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute("INSERT INTO download_logs (user_name, file_name, timestamp) VALUES (?, ?, ?)",
+                     (user_name, file_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        logger.info(f"Пользователь {user_name} скачал файл: {file_name}")
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка логирования: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 # --- Клавиатуры ---
 
@@ -127,6 +158,8 @@ async def send_welcome(message: types.Message, state: FSMContext):
         await message.answer("Привет, Админ! Доступ разрешен.", reply_markup=get_admin_menu())
     else:
         await message.answer("Привет! Выберите раздел:", reply_markup=get_main_menu())
+    
+    logger.info(f"Пользователь {user_name} запустил бота")
 
 # --- Логика Администратора ---
 
@@ -144,29 +177,40 @@ async def admin_add_name(message: types.Message, state: FSMContext):
 
 @dp.message(AddingUser.admin, F.text.in_(['0', '1']))
 async def admin_add_finish(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    u_name = data['new_user_name']
-    u_role = int(message.text)
-   
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("INSERT OR REPLACE INTO users (user_name, is_admin) VALUES (?, ?)", (u_name, u_role))
-    conn.commit()
-    conn.close()
-   
-    await message.answer(f"Пользователь {u_name} сохранен.", reply_markup=get_admin_menu())
-    await state.clear()
+    try:
+        data = await state.get_data()
+        u_name = data['new_user_name']
+        u_role = int(message.text)
+       
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute("INSERT OR REPLACE INTO users (user_name, is_admin) VALUES (?, ?)", (u_name, u_role))
+        conn.commit()
+        conn.close()
+       
+        await message.answer(f"Пользователь {u_name} сохранен.", reply_markup=get_admin_menu())
+        await state.clear()
+        logger.info(f"Админ добавил пользователя {u_name} с ролью {'админ' if u_role else 'пользователь'}")
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении пользователя: {e}")
+        await message.answer("Произошла ошибка при добавлении пользователя.")
+        await state.clear()
 
 @dp.message(F.text == "Выгрузить отчет (Excel)")
 async def export_report(message: types.Message):
-    if is_admin(message.from_user.username):
-        conn = sqlite3.connect(DB_NAME)
-        df = pd.read_sql_query("SELECT * FROM download_logs", conn)
-        conn.close()
-       
-        file_path = "report.xlsx"
-        df.to_excel(file_path, index=False)
-        await message.answer_document(FSInputFile(file_path), caption="Отчет об активности")
-        os.remove(file_path)
+    try:
+        if is_admin(message.from_user.username):
+            conn = sqlite3.connect(DB_NAME)
+            df = pd.read_sql_query("SELECT * FROM download_logs", conn)
+            conn.close()
+           
+            file_path = "report.xlsx"
+            df.to_excel(file_path, index=False)
+            await message.answer_document(FSInputFile(file_path), caption="Отчет об активности")
+            os.remove(file_path)
+            logger.info(f"Админ {message.from_user.username} выгрузил отчет")
+    except Exception as e:
+        logger.error(f"Ошибка при выгрузке отчета: {e}")
+        await message.answer("Произошла ошибка при формировании отчета.")
 
 # --- Логика пользователя и файлов ---
 
@@ -189,6 +233,7 @@ async def show_strategies(message: types.Message):
         kb = [[types.KeyboardButton(text=p)] for p in all_products]
         keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
         await message.answer("Выберите стратегию:", reply_markup=keyboard)
+        logger.info(f"Пользователь {user_id} открыл меню презентаций")
 
 @dp.message(F.text == "Назад")
 async def go_back(message: types.Message):
@@ -198,28 +243,45 @@ async def go_back(message: types.Message):
 
 @dp.message(F.text.in_(all_products))
 async def send_pdf(message: types.Message):
-    if message.text == "Назад": return
-   
-    user_name = message.from_user.username or "Unknown"
-    product = message.text
-    found = False
+    try:
+        if message.text == "Назад": 
+            return
+       
+        user_name = message.from_user.username or "Unknown"
+        product = message.text
+        found = False
 
-    if os.path.exists(PDF_FOLDER_PATH):
-        for file in os.listdir(PDF_FOLDER_PATH):
-            if file.endswith(".pdf") and product.lower() in file.lower():
-                await message.answer_document(FSInputFile(os.path.join(PDF_FOLDER_PATH, file)))
-                log_event(user_name, file)
-                found = True
-   
-    if not found:
-        await message.answer("К сожалению, файлы по этой стратегии еще не загружены.")
+        if PDF_FOLDER_PATH.exists():
+            for file in os.listdir(PDF_FOLDER_PATH):
+                if file.endswith(".pdf") and product.lower() in file.lower():
+                    file_path = PDF_FOLDER_PATH / file
+                    await message.answer_document(FSInputFile(file_path))
+                    log_event(user_name, file)
+                    found = True
+                    break
+       
+        if not found:
+            await message.answer("К сожалению, файлы по этой стратегии еще не загружены.")
+            logger.warning(f"Файл для '{product}' не найден (пользователь: {user_name})")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке файла: {e}")
+        await message.answer("Произошла ошибка при загрузке файла.")
 
 async def main():
     init_db()
-    await dp.start_polling(bot)
+    logger.info("Бот запускается...")
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Критическая ошибка polling: {e}")
+    finally:
+        await bot.session.close()
+        logger.info("Бот остановлен, сессия закрыта")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен")
+        logger.info("Бот остановлен пользователем")
+    except Exception as e:
+        logger.critical(f"Необработанная ошибка: {e}")
